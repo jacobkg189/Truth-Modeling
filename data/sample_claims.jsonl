@@ -1,0 +1,24 @@
+{"claim": "The Eiffel Tower is located in Paris.", "label": "SUPPORTED"}
+{"claim": "Mount Everest is the highest mountain above sea level on Earth.", "label": "SUPPORTED"}
+{"claim": "Marie Curie won Nobel Prizes in both physics and chemistry.", "label": "SUPPORTED"}
+{"claim": "The Great Barrier Reef is located off the coast of Queensland, Australia.", "label": "SUPPORTED"}
+{"claim": "Neil Armstrong was the first person to walk on the Moon.", "label": "SUPPORTED"}
+{"claim": "The Amazon River flows through Brazil.", "label": "SUPPORTED"}
+{"claim": "Facebook was founded by Mark Zuckerberg and fellow Harvard students.", "label": "SUPPORTED"}
+{"claim": "The Pacific Ocean is the largest ocean on Earth.", "label": "SUPPORTED"}
+{"claim": "Leonardo da Vinci painted the Mona Lisa.", "label": "SUPPORTED"}
+{"claim": "Facebook was launched in 2004.", "label": "SUPPORTED"}
+{"claim": "The Eiffel Tower is located in Rome.", "label": "REFUTED"}
+{"claim": "The Great Wall of China is located in Japan.", "label": "REFUTED"}
+{"claim": "Albert Einstein was born in France.", "label": "REFUTED"}
+{"claim": "Mount Kilimanjaro is located in Peru.", "label": "REFUTED"}
+{"claim": "William Shakespeare wrote the novel Don Quixote.", "label": "REFUTED"}
+{"claim": "Facebook was founded in 2010.", "label": "REFUTED"}
+{"claim": "Neil Armstrong was a Soviet cosmonaut.", "label": "REFUTED"}
+{"claim": "Mercury is the largest planet in the Solar System.", "label": "REFUTED"}
+{"claim": "The Mona Lisa was painted by Vincent van Gogh.", "label": "REFUTED"}
+{"claim": "Marie Curie was born in Germany.", "label": "REFUTED"}
+{"claim": "Gustave Eiffel's favorite color was green.", "label": "NOT ENOUGH INFO"}
+{"claim": "Leonardo da Vinci's favorite food was figs.", "label": "NOT ENOUGH INFO"}
+{"claim": "Mark Zuckerberg's childhood best friend was named Thomas.", "label": "NOT ENOUGH INFO"}
+{"claim": "Marie Curie's favorite song was a Polish lullaby.", "label": "NOT ENOUGH INFO"}
