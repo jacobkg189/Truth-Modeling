@@ -11,7 +11,9 @@ from dataclasses import replace
 from typing import Any
 
 from .config import Config, load_dotenv
-from .pipeline import ClaimResult, FactChecker, Report
+from .pipeline import SOURCE_NAMES, ClaimResult, FactChecker, Report
+from .reliability import SourceReliability, default_reliability_path
+from .text import bm25_scores, split_sentences
 from .verdict import Label
 
 _COLORS = {
@@ -43,6 +45,8 @@ def claim_to_dict(result: ClaimResult, max_evidence: int = 3) -> dict[str, Any]:
                 "contradicts": round(j.stance.contradicts, 3),
                 "says_nothing": round(j.stance.says_nothing, 3),
                 "order_agreement": j.stance.order_agreement,
+                "site": j.site,
+                "site_weight": round(j.reliability, 3),
                 "title": j.passage.title,
                 "section": j.passage.section,
                 "url": j.passage.url,
@@ -85,13 +89,11 @@ def render_text(report: Report, color: bool, verbose: bool) -> str:
         lines.append(f"  “{result.claim}”")
         for reason in v.reasons:
             lines.append(paint(_DIM, f"  · {reason}"))
-        shown = result.evidence if verbose else result.evidence[:1]
-        for j in shown:
-            if not verbose and j.stance.label == "says_nothing":
-                continue
-            snippet = j.passage.text if verbose else _truncate(j.passage.text, 220)
+        for j in result.evidence if verbose else _headline_evidence(result):
+            snippet = j.passage.text if verbose else best_excerpt(j.passage.text, result.claim, 220)
             lines.append(
-                f"  {paint(_DIM, j.stance.label + f' {j.weight:.2f}')} {j.passage.title}"
+                f"  {paint(_DIM, j.stance.label + f' {j.weight:.2f}')} "
+                f"{paint(_BOLD, j.site)} {paint(_DIM, f'(weight {j.reliability:.2f})')} {j.passage.title}"
                 + (f" › {j.passage.section}" if j.passage.section else "")
             )
             lines.append(paint(_DIM, f"    {snippet}"))
@@ -114,6 +116,49 @@ def render_text(report: Report, color: bool, verbose: bool) -> str:
     return "\n".join(lines)
 
 
+def _headline_evidence(result: ClaimResult, limit: int = 2) -> list:
+    """The most decisive passage from each of the top sites, skipping neutral ones."""
+    shown, sites = [], set()
+    for j in result.evidence:
+        if j.stance.label == "says_nothing" or j.site in sites:
+            continue
+        shown.append(j)
+        sites.add(j.site)
+        if len(shown) == limit:
+            break
+    return shown
+
+
+def render_weights(reliability: SourceReliability, limit: int = 40) -> str:
+    rows = reliability.table()
+    if not rows:
+        return f"No learned site weights yet ({reliability.path}). Priors are in reliability.py."
+    lines = [f"{'site':<32}{'weight':>7}{'prior':>7}{'agree':>8}{'disagree':>9}"]
+    for site, weight, prior, agree, disagree in rows[:limit]:
+        arrow = "↑" if weight > prior + 0.005 else "↓" if weight < prior - 0.005 else " "
+        lines.append(f"{site:<32}{weight:>6.2f}{arrow}{prior:>7.2f}{agree:>8.1f}{disagree:>9.1f}")
+    lines.append(f"\n{len(rows)} site(s) with history · {reliability.path}")
+    return "\n".join(lines)
+
+
+def best_excerpt(text: str, claim: str, limit: int) -> str:
+    """The sentence that best matches the claim, widened with its neighbours up to ``limit``."""
+    sentences = split_sentences(text)
+    if len(text) <= limit or len(sentences) < 2:
+        return _truncate(text, limit)
+    scores = bm25_scores(claim, sentences)
+    start = end = scores.index(max(scores))
+    while True:
+        grew = False
+        for i in (end + 1, start - 1):
+            if 0 <= i < len(sentences) and len(" ".join(sentences[min(start, i) : max(end, i) + 1])) <= limit:
+                start, end, grew = min(start, i), max(end, i), True
+        if not grew:
+            break
+    excerpt = _truncate(" ".join(sentences[start : end + 1]), limit)
+    return ("… " if start > 0 else "") + excerpt + (" …" if end < len(sentences) - 1 else "")
+
+
 def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
@@ -132,13 +177,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat every sentence as a claim instead of letting Jev pick the factual ones.",
     )
-    parser.add_argument("--source", choices=["wikipedia", "local"], default="wikipedia")
-    parser.add_argument("--corpus", help="Directory of .txt/.md files for --source local.")
+    parser.add_argument(
+        "--sources",
+        default="wikipedia,web",
+        help=f"Comma-separated evidence sources from {', '.join(SOURCE_NAMES)} (default: wikipedia,web).",
+    )
+    parser.add_argument("--corpus", help="Directory of trusted .txt/.md files (adds the 'local' source).")
+    parser.add_argument(
+        "--no-learn", action="store_true", help="Don't update site weights from this run's verdicts."
+    )
+    parser.add_argument("--weights", action="store_true", help="Show learned site weights and exit.")
     parser.add_argument("--lang", default="en", help="Wikipedia language code (default: en).")
     parser.add_argument("--model", help="Jev model ID or alias (default: jev-latest).")
-    parser.add_argument("--max-passages", type=int, help="Passages judged per claim (default: 6).")
-    parser.add_argument("--no-cache", action="store_true", help="Do not use the on-disk Wikipedia cache.")
+    parser.add_argument("--max-passages", type=int, help="Passages judged per claim (default: 8).")
+    parser.add_argument("--no-cache", action="store_true", help="Do not use the on-disk search cache.")
     return parser
+
+
+def parse_sources(spec: str, corpus: str | None) -> list[str]:
+    names = [name.strip() for name in spec.split(",") if name.strip()]
+    if corpus and "local" not in names:
+        names.append("local")
+    return names
 
 
 async def _run(args: argparse.Namespace, text: str) -> Report:
@@ -146,12 +206,13 @@ async def _run(args: argparse.Namespace, text: str) -> Report:
     if args.max_passages:
         config = replace(config, max_passages=args.max_passages)
     checker = FactChecker.create(
-        source=args.source,
+        sources=parse_sources(args.sources, args.corpus),
         corpus_dir=args.corpus,
         lang=args.lang,
         model=args.model,
         config=config,
         cache=not args.no_cache,
+        learn=not args.no_learn,
     )
     async with checker:
         return await checker.check_text(text, detect_claims=not args.no_detect)
@@ -160,6 +221,9 @@ async def _run(args: argparse.Namespace, text: str) -> Report:
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
+    if args.weights:
+        print(render_weights(SourceReliability(default_reliability_path())))
+        return 0
     if args.file:
         with open(args.file) as handle:
             text = handle.read()

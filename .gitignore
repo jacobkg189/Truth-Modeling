@@ -4,3 +4,6 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 results*.jsonl
+data/fever_paper_dev.jsonl
+data/*results*.jsonl
+data/heldout_*.jsonl

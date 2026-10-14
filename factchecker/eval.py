@@ -1,11 +1,12 @@
 """Measure accuracy, coverage and speed on labelled claims.
 
 Input is JSON Lines with a ``claim`` and a ``label`` per line. Labels may use
-this project's names or FEVER's (SUPPORTS / REFUTES / NOT ENOUGH INFO), so a
-FEVER dev split can be evaluated directly:
+this project's names, FEVER's (SUPPORTS / REFUTES / NOT ENOUGH INFO) or plain
+true/false (RealFactBench), so public benchmarks can be evaluated directly:
 
     factcheck-eval data/sample_claims.jsonl
     factcheck-eval fever_dev.jsonl --limit 500 --out results.jsonl
+    factcheck-eval realfactbench.jsonl --group-by task
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import statistics
 import sys
@@ -20,10 +22,11 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from .cli import claim_to_dict
+from .cli import claim_to_dict, parse_sources
 from .config import Config, load_dotenv
-from .pipeline import ClaimResult, FactChecker
-from .verdict import Label
+from .pipeline import ClaimResult, FactChecker, Report
+from .text import split_sentences
+from .verdict import Label, Verdict
 
 _LABEL_ALIASES = {
     "SUPPORTS": Label.SUPPORTED,
@@ -54,6 +57,83 @@ def load_examples(path: str | Path, limit: int | None = None) -> list[tuple[str,
             if limit and len(examples) >= limit:
                 break
     return examples
+
+
+def load_groups(path: str | Path, field: str, limit: int | None = None) -> list[str]:
+    """The value of ``field`` for each example, aligned with ``load_examples``."""
+    groups = []
+    with open(path) as handle:
+        for line in handle:
+            if line.strip():
+                groups.append(str(json.loads(line).get(field)))
+                if limit and len(groups) >= limit:
+                    break
+    return groups
+
+
+def combine_report(claim: str, report: Report) -> ClaimResult:
+    """One verdict for a multi-sentence text: false if any part is refuted.
+
+    This is how benchmarks of long answers (RealFactBench's knowledge validation,
+    FELM, FacTool) are labelled: a single wrong detail makes the whole answer false.
+    """
+    claims = report.claims
+    refuted = [c for c in claims if c.verdict.label is Label.REFUTED]
+    if refuted:
+        worst = max(refuted, key=lambda c: c.verdict.confidence)
+        label, confidence = Label.REFUTED, worst.verdict.confidence
+        reasons = [f"Refuted part: “{worst.claim}”"]
+    elif claims and all(c.verdict.label is Label.SUPPORTED for c in claims):
+        label, confidence = Label.SUPPORTED, min(c.verdict.confidence for c in claims)
+        reasons = [f"All {len(claims)} parts supported."]
+    else:
+        label, confidence = Label.NOT_ENOUGH_EVIDENCE, 0.0
+        reasons = ["No checkable claims found." if not claims else "Some parts could not be verified."]
+    needs_review = any(c.verdict.needs_review for c in claims) or label is Label.NOT_ENOUGH_EVIDENCE
+    verdict = Verdict(
+        label,
+        confidence,
+        max((c.verdict.support for c in claims), default=0.0),
+        max((c.verdict.refute for c in claims), default=0.0),
+        needs_review,
+        reasons,
+    )
+    evidence = sorted((j for c in claims for j in c.evidence), key=lambda j: j.weight, reverse=True)
+    errors = [c.error for c in claims if c.error]
+    return ClaimResult(claim, verdict, evidence, [], report.seconds, None, errors[0] if errors else None)
+
+
+def binary_metrics(golds: list[Label], predictions: list[Label]) -> dict:
+    """RealFactBench's metrics for true/false benchmarks.
+
+    Any answer other than SUPPORTED or REFUTED counts as "unknown". Unknowns stay in the
+    F1 and MCC denominators and score as misses, and the unknown rate is reported
+    alongside, as in the RealFactBench paper.
+    """
+    decided = {Label.SUPPORTED, Label.REFUTED}
+    f1s = []
+    for label in (Label.SUPPORTED, Label.REFUTED):
+        tp = sum(g is label and p is label for g, p in zip(golds, predictions))
+        fp = sum(g is not label and p is label for g, p in zip(golds, predictions))
+        fn = sum(g is label and p is not label for g, p in zip(golds, predictions))
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1s.append(2 * precision * recall / (precision + recall) if precision + recall else 0.0)
+    # MCC needs a binary prediction: an unknown is counted as the wrong answer.
+    forced = [p if p in decided else (Label.REFUTED if g is Label.SUPPORTED else Label.SUPPORTED)
+              for g, p in zip(golds, predictions)]
+    tp = sum(g is Label.SUPPORTED and p is Label.SUPPORTED for g, p in zip(golds, forced))
+    tn = sum(g is Label.REFUTED and p is Label.REFUTED for g, p in zip(golds, forced))
+    fp = sum(g is Label.REFUTED and p is Label.SUPPORTED for g, p in zip(golds, forced))
+    fn = sum(g is Label.SUPPORTED and p is Label.REFUTED for g, p in zip(golds, forced))
+    denominator = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    answered = [(g, p) for g, p in zip(golds, predictions) if p in decided]
+    return {
+        "f1_macro": statistics.fmean(f1s),
+        "mcc": (tp * tn - fp * fn) / denominator if denominator else 0.0,
+        "unknown_rate": 1 - len(answered) / len(golds) if golds else 0.0,
+        "accuracy_when_answered": sum(g is p for g, p in answered) / len(answered) if answered else 0.0,
+    }
 
 
 def summarize(golds: list[Label], results: list[ClaimResult]) -> dict:
@@ -96,6 +176,8 @@ def summarize(golds: list[Label], results: list[ClaimResult]) -> dict:
             g.value: dict(Counter(p.value for gg, p in zip(golds, predictions) if gg == g))
             for g in _GOLD_LABELS
         },
+        **({"binary": binary_metrics(golds, predictions)}
+           if golds and Label.NOT_ENOUGH_EVIDENCE not in golds else {}),
         "errors": sum(r.error is not None for r in results),
         "latency_p50_s": latencies[len(latencies) // 2] if latencies else 0.0,
         "latency_p95_s": latencies[min(len(latencies) - 1, int(len(latencies) * 0.95))] if latencies else 0.0,
@@ -103,12 +185,20 @@ def summarize(golds: list[Label], results: list[ClaimResult]) -> dict:
 
 
 async def evaluate(
-    examples: list[tuple[str, Label]], checker: FactChecker, concurrency: int = 8
+    examples: list[tuple[str, Label]],
+    checker: FactChecker,
+    concurrency: int = 8,
+    claim_mode: str = "auto",
 ) -> list[ClaimResult]:
     limit = asyncio.Semaphore(concurrency)
 
     async def one(claim: str) -> ClaimResult:
         async with limit:
+            as_text = claim_mode == "text" or (
+                claim_mode == "auto" and len(split_sentences(claim)) > 1
+            )
+            if as_text:
+                return combine_report(claim, await checker.check_text(claim))
             return await checker.check_claim(claim)
 
     return list(await asyncio.gather(*(one(claim) for claim, _ in examples)))
@@ -120,10 +210,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("dataset", help="JSON Lines file with 'claim' and 'label' fields.")
     parser.add_argument("--limit", type=int, help="Evaluate only the first N examples.")
     parser.add_argument("--concurrency", type=int, default=8, help="Claims checked at once.")
-    parser.add_argument("--source", choices=["wikipedia", "local"], default="wikipedia")
-    parser.add_argument("--corpus", help="Directory of .txt/.md files for --source local.")
+    parser.add_argument("--sources", default="wikipedia,web", help="Comma-separated evidence sources.")
+    parser.add_argument("--corpus", help="Directory of trusted .txt/.md files (adds the 'local' source).")
+    parser.add_argument(
+        "--learn",
+        action="store_true",
+        help="After scoring, update site weights from the gold labels. Learn on a training "
+        "split and evaluate on a different one, or the next score will be inflated.",
+    )
+    parser.add_argument("--weights-file", help="Site-weights file to read and update (default: the shared one).")
     parser.add_argument("--model", help="Jev model ID or alias (default: jev-latest).")
     parser.add_argument("--out", help="Write one JSON line per claim with prediction and evidence.")
+    parser.add_argument(
+        "--claim-mode",
+        choices=["auto", "claim", "text"],
+        default="auto",
+        help="'claim': check each line as one claim. 'text': find the claims in each line and "
+        "call it false if any is refuted. 'auto' (default): 'text' for multi-sentence lines.",
+    )
+    parser.add_argument("--group-by", help="Also report metrics per value of this JSON field (e.g. task).")
+    parser.add_argument(
+        "--exclude-domains",
+        default="",
+        help="Comma-separated domains web search must skip, e.g. the fact-checkers a benchmark's "
+        "labels came from, so the checker can't simply look up the answer.",
+    )
     args = parser.parse_args(argv)
     if not os.environ.get("TYPESAFE_API_KEY"):
         print("Set TYPESAFE_API_KEY (in the environment or a .env file).", file=sys.stderr)
@@ -132,15 +243,40 @@ def main(argv: list[str] | None = None) -> int:
     examples = load_examples(args.dataset, args.limit)
 
     async def run() -> tuple[list[ClaimResult], FactChecker]:
-        checker = FactChecker.create(source=args.source, corpus_dir=args.corpus, model=args.model, config=Config())
+        # Consensus learning stays off while measuring, so every claim is scored with the
+        # same weights and the result doesn't depend on the order claims finish in.
+        checker = FactChecker.create(
+            sources=parse_sources(args.sources, args.corpus),
+            corpus_dir=args.corpus,
+            model=args.model,
+            config=Config(),
+            reliability_path=args.weights_file,
+            learn=False,
+            web_exclude_domains=tuple(d.strip() for d in args.exclude_domains.split(",") if d.strip()),
+        )
         async with checker:
-            return await evaluate(examples, checker, args.concurrency), checker
+            results = await evaluate(examples, checker, args.concurrency, args.claim_mode)
+            if args.learn:
+                updates = sum(checker.learn_from_label(r, gold) for r, (_, gold) in zip(results, examples))
+                print(f"Recorded {updates} site observations from gold labels.", file=sys.stderr)
+            return results, checker
 
     started = time.perf_counter()
     results, checker = asyncio.run(run())
     wall = time.perf_counter() - started
     golds = [label for _, label in examples]
     summary = summarize(golds, results)
+    if args.group_by:
+        groups = load_groups(args.dataset, args.group_by, args.limit)
+        summary["by_" + args.group_by] = {
+            group: _compact(
+                summarize(
+                    [g for g, k in zip(golds, groups) if k == group],
+                    [r for r, k in zip(results, groups) if k == group],
+                )
+            )
+            for group in sorted(set(groups))
+        }
     usage = checker.judge.usage
     summary.update(
         wall_seconds=round(wall, 2),
@@ -166,6 +302,11 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(json.dumps(summary, indent=2))
     return 0
+
+
+def _compact(summary: dict) -> dict:
+    keep = ("examples", "accuracy", "macro_f1", "binary", "auto_accepted_share", "auto_accepted_accuracy", "errors")
+    return {k: summary[k] for k in keep if k in summary}
 
 
 if __name__ == "__main__":

@@ -184,11 +184,11 @@ def chunk_document(text: str, max_words: int = 120) -> list[tuple[str | None, st
         if len(words) <= max_words:
             passages.append((section, line))
             continue
-        passages.extend((section, window) for window in _sentence_windows(line, max_words))
+        passages.extend((section, window) for window in sentence_windows(line, max_words))
     return passages
 
 
-def _sentence_windows(paragraph: str, max_words: int) -> list[str]:
+def sentence_windows(paragraph: str, max_words: int) -> list[str]:
     """Group sentences into windows of about max_words, overlapping by one sentence."""
     sentences = split_sentences(paragraph)
     windows: list[str] = []

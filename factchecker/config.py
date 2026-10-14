@@ -18,16 +18,20 @@ class Config:
     claim_threshold: float = 0.5
 
     # Retrieval.
-    search_limit: int = 6  # candidate documents fetched from the evidence source
-    max_documents: int = 3  # documents kept after Jev's relevance filter
+    search_limit: int = 6  # candidate documents fetched from each evidence source
+    max_documents: int = 3  # documents kept per source after Jev's relevance filter
     min_document_relevance: float = 0.3  # Noul floor for keeping a candidate document
-    max_passages: int = 6  # passages sent to Jev for a stance judgment, per claim
+    max_passages: int = 8  # passages sent to Jev for a stance judgment, per claim
     passage_words: int = 120  # target passage length when chunking documents
 
     # Verdict aggregation (see verdict.py).
-    decide_threshold: float = 0.6  # strongest support/contradiction needed to commit
-    conflict_threshold: float = 0.5  # both sides at least this -> CONFLICTING
+    decide_threshold: float = 0.6  # pooled support/contradiction needed to commit
+    conflict_threshold: float = 0.5  # both sides at least this ...
+    conflict_margin: float = 0.3  # ... and closer than this -> CONFLICTING
     review_below: float = 0.75  # verdict confidence under this is flagged for review
+
+    # Source reliability learning (see reliability.py).
+    learn_min_confidence: float = 0.8  # leave-one-out verdict needed to score a site
 
     # Throughput.
     max_concurrency: int = 32  # simultaneous Jev requests (API limit is ~80 rps)

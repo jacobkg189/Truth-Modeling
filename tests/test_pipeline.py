@@ -4,12 +4,15 @@ import httpx2
 import pytest
 from typesafe_sdk import Choice, Noul, TypeSafeAuthenticationError, TypeSafeInternalServerError
 
-from factchecker.cli import render_text, report_to_dict
+from factchecker.cli import best_excerpt, render_text, report_to_dict
 from factchecker.jev import STANCE_OPTIONS, JevJudge
+from factchecker.reliability import SourceReliability
 from factchecker.sources import Passage
 from factchecker.verdict import Label
 
-from .conftest import FakeJev, make_checker
+from factchecker.pipeline import FactChecker
+
+from .conftest import FakeJev, FakeSource, make_checker
 
 DOCUMENTS = {
     "Eiffel Tower": [
@@ -143,3 +146,96 @@ async def test_close_closes_client():
     async with make_checker(DOCUMENTS, jev):
         pass
     assert jev.closed
+
+
+async def test_consensus_learning_updates_site_weights():
+    documents = {
+        "Wire One": ["The Eiffel Tower is in Paris. [SUPPORTS]"],
+        "Wire Two": ["The Eiffel Tower stands in Paris, France. [SUPPORTS]"],
+        "Hoax Blog": ["The Eiffel Tower was moved to Rome. [CONTRADICTS]"],
+    }
+    reliability = SourceReliability(priors={"wire-one.example": 0.95, "wire-two.example": 0.95})
+    checker = make_checker(documents, reliability=reliability, learn=True, min_document_relevance=0.0)
+    result = await checker.check_claim("The Eiffel Tower is in Paris.")
+    assert result.verdict.label is Label.SUPPORTED
+    assert {j.site for j in result.evidence} == {"wire-one.example", "wire-two.example", "hoax-blog.example"}
+    assert reliability.records["hoax-blog.example"].disagreements > 0
+    assert reliability.weight("hoax-blog.example") < reliability.prior("hoax-blog.example")
+
+
+async def test_learning_is_off_unless_enabled_and_labels_can_teach():
+    documents = {"Wire One": ["The Eiffel Tower is in Paris. [SUPPORTS]"], "Other": ["[CONTRADICTS] no"]}
+    reliability = SourceReliability()
+    checker = make_checker(documents, reliability=reliability, min_document_relevance=0.0)
+    result = await checker.check_claim("The Eiffel Tower is in Paris.")
+    assert reliability.records == {}
+    assert checker.learn_from_label(result, Label.SUPPORTED) == 2
+    assert reliability.records["wire-one.example"].agreements > 0
+    assert reliability.records["other.example"].disagreements > 0
+    assert checker.learn_from_label(result, Label.NOT_ENOUGH_EVIDENCE) == 0
+
+
+async def test_passage_selection_covers_every_site_first():
+    documents = {
+        "Big Site": [f"Eiffel Tower fact number {i} about the tower in Paris." for i in range(10)],
+        "Small Site": ["A short note that mentions the tower once, briefly."],
+    }
+    jev = FakeJev()
+    checker = make_checker(documents, jev, max_passages=2, min_document_relevance=0.0)
+    await checker.check_claim("The Eiffel Tower is in Paris.")
+    judged_sites = {state["evidence"]["source"] for state, _ in jev.calls if "evidence" in state}
+    assert judged_sites == {"Big Site", "Small Site"}
+
+
+def test_best_excerpt_centers_on_matching_sentence():
+    text = (
+        "Facebook is a social network owned by Meta Platforms. It was founded in 2004 by Mark Zuckerberg. "
+        "It had three billion users in 2021. The company's headquarters are in Menlo Park, California. "
+        "It sells advertising."
+    )
+    excerpt = best_excerpt(text, "The company is headquartered in Menlo Park.", 120)
+    assert "Menlo Park" in excerpt and len(excerpt) <= 126
+    assert excerpt.startswith("… ")
+    assert best_excerpt("Short text.", "anything", 120) == "Short text."
+
+
+async def test_claim_with_unresolved_subject_is_not_checked():
+    jev = FakeJev()
+    checker = make_checker({"Walk Score": ["The company is headquartered in Seattle. [SUPPORTS]"]}, jev)
+    result = await checker.check_claim("The company is headquartered in Seattle.")
+    assert result.verdict.label is Label.NOT_ENOUGH_EVIDENCE and result.verdict.needs_review
+    assert "the company" in result.verdict.reasons[0].lower()
+    assert jev.calls == []  # no search, no model calls
+
+    named = await checker.check_claim("The company Walk Score is headquartered in Seattle.")
+    assert named.verdict.label is Label.SUPPORTED
+
+
+def test_unresolved_reference():
+    from factchecker.pipeline import unresolved_reference
+
+    assert unresolved_reference("It was built in 1889.") == "It"
+    assert unresolved_reference("The company is based in Ohio.") == "The company"
+    assert unresolved_reference("The company Apple was founded in 1976.") is None
+    assert unresolved_reference("Italy is in Europe.") is None
+    assert unresolved_reference("Its capital is Rome.") == "Its"
+
+
+async def test_unavailable_source_is_noted_in_the_verdict():
+    import httpx
+
+    from factchecker.sources import MultiSource
+
+    from .test_sources import StaticSource
+
+    class Down(StaticSource):
+        async def search(self, query, limit):
+            raise httpx.HTTPStatusError(
+                "429", request=httpx.Request("POST", "https://x"), response=httpx.Response(429)
+            )
+
+    source = MultiSource([Down("web"), FakeSource({"Eiffel Tower": DOCUMENTS["Eiffel Tower"]})])
+    checker = FactChecker(JevJudge(FakeJev()), source)
+    result = await checker.check_claim("The Eiffel Tower is in Paris.")
+    assert result.verdict.label is Label.SUPPORTED
+    assert "The web source was unavailable (HTTP 429); checked without it." in result.verdict.reasons

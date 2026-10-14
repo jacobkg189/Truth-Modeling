@@ -8,6 +8,7 @@ from typesafe_sdk import Choice, Noul, SystemOneResponse
 from factchecker.config import Config
 from factchecker.jev import JevJudge
 from factchecker.pipeline import FactChecker
+from factchecker.reliability import SourceReliability
 from factchecker.sources import Candidate, Passage
 
 
@@ -79,11 +80,14 @@ class FakeSource:
 
     async def search(self, query: str, limit: int) -> list[Candidate]:
         self.queries.append(query)
-        return [Candidate(id=t, title=t, snippet=texts[0][:80]) for t, texts in self.documents.items()][:limit]
+        return [
+            Candidate(id=t, title=t, snippet=texts[0][:80], url=site_url(t), source=self.name)
+            for t, texts in self.documents.items()
+        ][:limit]
 
     async def passages(self, candidate: Candidate, max_words: int) -> list[Passage]:
         return [
-            Passage("fake", candidate.title, text, f"https://example.org/{candidate.title}", None, i)
+            Passage("fake", candidate.title, text, site_url(candidate.title), None, i)
             for i, text in enumerate(self.documents[candidate.title])
         ]
 
@@ -91,10 +95,28 @@ class FakeSource:
         return None
 
 
+def site_url(title: str) -> str:
+    """Each fake document lives on its own website: "Eiffel Tower" -> eiffel-tower.example."""
+    return f"https://{title.lower().replace(' ', '-')}.example/"
+
+
 @pytest.fixture
 def fake_jev() -> FakeJev:
     return FakeJev()
 
 
-def make_checker(documents: dict[str, list[str]], jev: FakeJev | None = None, **config: Any) -> FactChecker:
-    return FactChecker(JevJudge(jev or FakeJev()), FakeSource(documents), Config(**config))
+def make_checker(
+    documents: dict[str, list[str]],
+    jev: FakeJev | None = None,
+    *,
+    reliability: SourceReliability | None = None,
+    learn: bool = False,
+    **config: Any,
+) -> FactChecker:
+    return FactChecker(
+        JevJudge(jev or FakeJev()),
+        FakeSource(documents),
+        Config(**config),
+        reliability=reliability,
+        learn=learn,
+    )

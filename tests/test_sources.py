@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 
@@ -148,3 +150,82 @@ async def test_token_bucket_allows_burst_then_paces():
     for _ in range(5):
         await bucket.acquire()
     assert time.monotonic() - started >= 0.09  # then 5 more at 50/s take ~0.1s
+
+
+TAVILY_RESPONSE = {
+    "results": [
+        {
+            "url": "https://www.nobelprize.org/curie",
+            "title": "Marie Curie – Biographical",
+            "content": "Marie Curie was born in Warsaw on November 7, 1867, the daughter of a teacher. "
+            "[...] She went to Paris in 1891 to continue her studies at the Sorbonne in physics. [...] ok",
+            "score": 0.8,
+        },
+        {"url": "https://empty.example/", "title": "Empty", "content": ""},
+    ]
+}
+
+
+async def test_web_search_keyless_parses_excerpts_into_passages():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = request.headers
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=TAVILY_RESPONSE)
+
+    source = sources.WebSearchSource(
+        api_key="", client=httpx.AsyncClient(transport=httpx.MockTransport(handler), headers={"X-Tavily-Access-Mode": "keyless"})
+    )
+    assert source.keyless
+    candidates = await source.search("Marie Curie was born in Germany", limit=5)
+    assert seen["body"]["max_results"] == 5 and seen["body"]["include_answer"] is False
+    assert [c.url for c in candidates] == ["https://www.nobelprize.org/curie"]  # empty result dropped
+    assert candidates[0].source == "web"
+    passages = await source.passages(candidates[0], 120)
+    assert [p.text[:20] for p in passages] == ["Marie Curie was born", "She went to Paris in"]
+    assert all(p.url == "https://www.nobelprize.org/curie" for p in passages)
+
+
+def test_web_search_auth_headers(monkeypatch):
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-test")
+    keyed = sources.WebSearchSource()
+    assert not keyed.keyless
+    assert keyed._http.client.headers["Authorization"] == "Bearer tvly-test"
+    monkeypatch.delenv("TAVILY_API_KEY")
+    keyless = sources.WebSearchSource()
+    assert keyless.keyless and keyless._http.client.headers["X-Tavily-Access-Mode"] == "keyless"
+
+
+class StaticSource:
+    def __init__(self, name, titles=(), error=None):
+        self.name, self.titles, self.error = name, titles, error
+
+    async def search(self, query, limit):
+        if self.error:
+            raise self.error
+        return [sources.Candidate(t, t, "", f"https://{self.name}.example/{t}") for t in self.titles]
+
+    async def passages(self, candidate, max_words):
+        return [sources.Passage(self.name, candidate.title, f"text from {self.name}")]
+
+    async def aclose(self):
+        return None
+
+
+async def test_multi_source_interleaves_tags_and_dispatches():
+    multi = sources.MultiSource([StaticSource("a", ["a1", "a2"]), StaticSource("b", ["b1"])])
+    candidates = await multi.search("q", 5)
+    assert [(c.source, c.id) for c in candidates] == [("a", "a1"), ("b", "b1"), ("a", "a2")]
+    passages = await multi.passages(candidates[1], 120)
+    assert passages[0].text == "text from b"
+
+
+async def test_multi_source_survives_one_failure_but_not_all():
+    failing = StaticSource("web", error=httpx.ConnectError("down"))
+    multi = sources.MultiSource([failing, StaticSource("wiki", ["w1"])])
+    assert [c.id for c in await multi.search("q", 5)] == ["w1"]
+    candidates, failures = await multi.search_with_failures("q", 5)
+    assert failures == {"web": "ConnectError"}
+    with pytest.raises(httpx.ConnectError):
+        await sources.MultiSource([failing]).search("q", 5)
